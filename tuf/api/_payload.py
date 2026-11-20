@@ -71,6 +71,20 @@ def _hash_file(f: IO[bytes], algo: str) -> str:
     return digest.hexdigest()
 
 
+def _check_keyid_in_store(keys: dict[str, Key], keyid: str) -> None:
+    """Raise ValueError if ``keyid`` is not in the ``keys`` store.
+
+    A role may reference a keyid that is missing from the key store: that
+    metadata is inconsistent but is accepted by deserialization and tolerated
+    by signature verification (``get_verification_result()`` only logs the
+    missing key). Mutating APIs must reject it explicitly instead of relying on
+    a dict lookup to fail part way through, so that callers always see the
+    documented ``ValueError`` and objects are never left half-modified.
+    """
+    if keyid not in keys:
+        raise ValueError(f"Key with id {keyid} not found in key store")
+
+
 class Signed(metaclass=abc.ABCMeta):
     """A base class for the signed part of TUF metadata.
 
@@ -631,12 +645,17 @@ class Root(Signed, _DelegatorMixin):
 
         Raises:
             ValueError: If ``role`` doesn't exist or if ``role`` doesn't include
-                the key.
+                the key or if ``keyid`` is not in the key store. In all of these
+                cases ``self`` is left unmodified.
         """
         if role not in self.roles:
             raise ValueError(f"Role {role} doesn't exist")
         if keyid not in self.roles[role].keyids:
             raise ValueError(f"Key with id {keyid} is not used by {role}")
+        # The role references the keyid but the key store does not contain it:
+        # reject before modifying anything so the object is not left in a
+        # half-revoked state.
+        _check_keyid_in_store(self.keys, keyid)
         self.roles[role].keyids.remove(keyid)
         for keyinfo in self.roles.values():
             if keyid in keyinfo.keyids:
@@ -1821,31 +1840,43 @@ class Targets(Signed, _DelegatorMixin):
         Raises:
             ValueError: If there are no delegated roles or if ``role`` is not
                 delegated by this ``Target`` or if key is not used by ``role``
-                or if key with id ``keyid`` is not used by succinct roles.
+                or if key with id ``keyid`` is not used by succinct roles or if
+                ``keyid`` is not in the key store. In all of these cases
+                ``self`` is left unmodified.
         """
         if self.delegations is None:
             raise ValueError(f"Delegated role {role} doesn't exist")
 
-        if self.delegations.roles is not None:
-            if role not in self.delegations.roles:
+        delegations = self.delegations
+        if delegations.roles is not None:
+            if role not in delegations.roles:
                 raise ValueError(f"Delegated role {role} doesn't exist")
-            if keyid not in self.delegations.roles[role].keyids:
-                raise ValueError(f"Key with id {keyid} is not used by {role}")
+            keyids = delegations.roles[role].keyids
+        elif delegations.succinct_roles is not None:
+            keyids = delegations.succinct_roles.keyids
+        else:
+            # Delegations guarantees that one of roles and succinct_roles is
+            # set: an object with neither is inconsistent.
+            raise ValueError("Delegations has neither roles nor succinct_roles")
 
-            self.delegations.roles[role].keyids.remove(keyid)
-            for keyinfo in self.delegations.roles.values():
+        if keyid not in keyids:
+            used_by = "succinct_roles" if delegations.roles is None else role
+            raise ValueError(f"Key with id {keyid} is not used by {used_by}")
+
+        # The role references the keyid but the key store does not contain it:
+        # this metadata is inconsistent (see Root.verify_delegate() which
+        # tolerates this when verifying). Reject before modifying anything so
+        # that the object is not left in a half-revoked state.
+        _check_keyid_in_store(delegations.keys, keyid)
+
+        keyids.remove(keyid)
+
+        if delegations.roles is not None:
+            for keyinfo in delegations.roles.values():
                 if keyid in keyinfo.keyids:
                     return
 
-        elif self.delegations.succinct_roles is not None:
-            if keyid not in self.delegations.succinct_roles.keyids:
-                raise ValueError(
-                    f"Key with id {keyid} is not used by succinct_roles"
-                )
-
-            self.delegations.succinct_roles.keyids.remove(keyid)
-
-        del self.delegations.keys[keyid]
+        del delegations.keys[keyid]
 
     def get_delegated_role(self, delegated_role: str) -> Role:
         """Return the role object for the given delegated role.

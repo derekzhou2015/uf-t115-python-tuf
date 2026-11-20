@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+* Metadata API: `Root.revoke_key()` and `Targets.revoke_key()` now raise the
+  documented `ValueError` (instead of `KeyError`) when a role's `keyids` list
+  references a keyid that is missing from the key store, and no longer leave
+  the object partially modified when they fail.
+
 ### Changed
 
 * Add Python 3.15 to tested versions, remove 3.10 from tested versions.

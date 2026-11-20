@@ -722,6 +722,140 @@ class TestMetadata(unittest.TestCase):
         with self.assertRaises(ValueError):
             root.signed.revoke_key(key.keyid, "nosuchrole")
 
+    def test_root_revoke_key_with_dangling_keyid(self) -> None:
+        """revoke_key() raises ValueError and leaves root untouched when a
+        role references a keyid that is missing from the key store.
+
+        This metadata mismatch is accepted by deserialization and tolerated by
+        verification (Root.verify_delegate() just logs the missing key), so it
+        can reach revoke_key() from metadata loaded from disk.
+        """
+        root = Root()
+        root.roles[Root.type] = Role(["dangling"], 1)
+
+        # Deserialization does not reject the mismatch
+        loaded = Metadata.from_bytes(Metadata(root).to_bytes())
+        self.assertIsInstance(loaded.signed, Root)
+        self.assertEqual(["dangling"], loaded.signed.roles[Root.type].keyids)
+        self.assertEqual({}, loaded.signed.keys)
+
+        # Verification tolerates it as well
+        with self.assertLogs("tuf.api._payload", level="INFO") as logs:
+            result = loaded.signed.get_verification_result(
+                Root.type, b"payload", {}
+            )
+        self.assertFalse(result)
+        self.assertIn("No key for keyid dangling", "\n".join(logs.output))
+
+        # revoke_key() must fail with ValueError, not KeyError ...
+        before = deepcopy(loaded.signed.to_dict())
+        with self.assertRaises(ValueError):
+            loaded.signed.revoke_key("dangling", Root.type)
+        # ... and leave the object exactly as it was
+        self.assertEqual(before, loaded.signed.to_dict())
+        self.assertEqual(["dangling"], loaded.signed.roles[Root.type].keyids)
+
+    def test_root_revoke_key_leaves_present_keys_alone(self) -> None:
+        """A key store entry that no role references stays untouched when
+        another role's dangling reference makes revoke_key() fail."""
+        present = Key.from_dict(
+            "present",
+            {
+                "keytype": "ed25519",
+                "keyval": {
+                    "public": "edcd0a32a07dce33f7c7873aaffbff36d20ea30787574ead335eefd337e4dacd"
+                },
+                "scheme": "ed25519",
+            },
+        )
+        root = Root(keys={"present": present})
+        root.roles[Root.type] = Role(["dangling"], 1)
+        root.roles[Snapshot.type] = Role(["dangling"], 1)
+
+        with self.assertRaises(ValueError):
+            root.revoke_key("dangling", Root.type)
+
+        self.assertEqual({"present"}, set(root.keys))
+        self.assertEqual(["dangling"], root.roles[Root.type].keyids)
+        self.assertEqual(["dangling"], root.roles[Snapshot.type].keyids)
+
+    def test_root_revoke_key_with_shared_dangling_keyid(self) -> None:
+        """Multiple roles referencing the same missing keyid: no role is
+        modified and the failure does not depend on role iteration order."""
+        for first_role in [Root.type, Snapshot.type, Timestamp.type]:
+            root = Root()
+            for role in [Root.type, Snapshot.type, Timestamp.type]:
+                root.roles[role] = Role(["dangling"], 1)
+
+            before = deepcopy(root.to_dict())
+            with self.assertRaises(ValueError):
+                root.revoke_key("dangling", first_role)
+            self.assertEqual(before, root.to_dict())
+
+            # the stored keys are untouched too
+            self.assertNotIn("dangling", root.keys)
+
+    def test_targets_revoke_key_with_dangling_keyid(self) -> None:
+        """Same guarantee for Targets.revoke_key() with delegated roles,
+        including when several delegated roles share the missing keyid."""
+        for revoke_from in ["role1", "role2"]:
+            role1 = DelegatedRole("role1", ["dangling"], 1, False, ["*"])
+            role2 = DelegatedRole("role2", ["dangling"], 1, False, ["*"])
+            targets = Targets(delegations=Delegations({}, {"role1": role1}))
+
+            before = deepcopy(targets.to_dict())
+            with self.assertRaises(ValueError):
+                targets.revoke_key("dangling", revoke_from)
+            self.assertEqual(before, targets.to_dict())
+
+            # shared mismatch: both roles keep the reference
+            targets = Targets(
+                delegations=Delegations({}, {"role1": role1, "role2": role2})
+            )
+            before = deepcopy(targets.to_dict())
+            with self.assertRaises(ValueError):
+                targets.revoke_key("dangling", revoke_from)
+            self.assertEqual(before, targets.to_dict())
+
+    def test_targets_revoke_key_with_dangling_keyid_succinct(self) -> None:
+        """Same guarantee for Targets.revoke_key() with succinct roles."""
+        targets = Targets(
+            delegations=Delegations(
+                {}, succinct_roles=SuccinctRoles(["dangling"], 1, 8, "bin")
+            )
+        )
+        before = deepcopy(targets.to_dict())
+        with self.assertRaises(ValueError):
+            targets.revoke_key("dangling")
+        self.assertEqual(before, targets.to_dict())
+
+    def test_revoke_key_delegations_without_roles(self) -> None:
+        """revoke_key() fails cleanly on an inconsistent delegations object
+        that has neither roles nor succinct_roles set."""
+        targets = Targets(
+            delegations=Delegations(
+                {}, {"role1": DelegatedRole("role1", [], 1, False, ["*"])}
+            )
+        )
+        assert targets.delegations is not None
+        targets.delegations.roles = None
+        key = Key.from_dict(
+            "keyid",
+            {
+                "keytype": "ed25519",
+                "keyval": {
+                    "public": "edcd0a32a07dce33f7c7873aaffbff36d20ea30787574ead335eefd337e4dacd"
+                },
+                "scheme": "ed25519",
+            },
+        )
+        targets.delegations.keys[key.keyid] = key
+
+        before = deepcopy(targets.to_dict())
+        with self.assertRaises(ValueError):
+            targets.revoke_key(key.keyid, "role1")
+        self.assertEqual(before, targets.to_dict())
+
     def test_is_target_in_pathpattern(self) -> None:
         supported_use_cases = [
             ("foo.tgz", "foo.tgz"),
